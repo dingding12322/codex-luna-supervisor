@@ -25,10 +25,10 @@
 
 默认执行面如下：
 
-| 执行面 | 用途 | 边界 |
-| --- | --- | --- |
-| 侧栏 Luna task | 非平凡实现、集成、修正和审查 | 每个 Writer 只写自己的明确范围 |
-| 原生只读 Scout | 有界的源码定位和证据收集 | 不写文件、不递归委派，只向父任务返回证据 |
+| 执行面           | 用途                                                           | 边界                                       |
+| ---------------- | -------------------------------------------------------------- | ------------------------------------------ |
+| 侧栏 Luna task   | 非平凡实现、集成、修正和审查                                   | 每个 Writer 只写自己的明确范围             |
+| 原生只读 Scout   | 有界的源码定位和证据收集                                       | 不写文件、不递归委派，只向父任务返回证据   |
 | `luna-fleet.mjs` | 应用内 Supervisor 需要严格隔离、持久化原始事件或恢复会话时使用 | 仅作为内部 fallback，不是独立 CLI 使用入口 |
 
 ## Supervisor 负责什么
@@ -68,12 +68,12 @@ flowchart LR
 
 ## 拓扑与并行
 
-| 拓扑 | 适用情况 | 主要约束 |
-| --- | --- | --- |
-| Single writer | 一个内聚的实现范围 | 必须记录为什么不需要拆分 |
-| Multi-writer | 多个责任范围可独立编辑 | 写范围不重叠，或使用隔离 worktree |
-| Integration Writer | 共享、生成、注册或横切文件需要修改 | 在实现阶段后顺序执行，独占共享文件 |
-| Reviewer | 风险值得增加独立核验 | 实现 Worker 空闲且集成完成后再启动，只读 |
+| 拓扑               | 适用情况                           | 主要约束                                 |
+| ------------------ | ---------------------------------- | ---------------------------------------- |
+| Single writer      | 一个内聚的实现范围                 | 必须记录为什么不需要拆分                 |
+| Multi-writer       | 多个责任范围可独立编辑             | 写范围不重叠，或使用隔离 worktree        |
+| Integration Writer | 共享、生成、注册或横切文件需要修改 | 在实现阶段后顺序执行，独占共享文件       |
+| Reviewer           | 风险值得增加独立核验               | 实现 Worker 空闲且集成完成后再启动，只读 |
 
 Runtime 和 UI 之间存在类型、事件或快照依赖，并不自动意味着必须串行。能够提前冻结的接口属于契约依赖；只有无法分离的写入重叠或真正的执行前置条件才要求顺序执行。
 
@@ -87,6 +87,8 @@ Worker 只在以下检查点通知 Supervisor：
 - `LUNA_BLOCKED`：需要 Supervisor 决策才能继续。
 - `LUNA_DONE`：Worker 已完成当前阶段。
 - `LUNA_CORRECTION_DONE`：定点修正已经完成。
+
+正常等待使用 callback-only：Worker 通过 reverse-send 交付上述 `LUNA_*` 事件来唤醒 Supervisor。Supervisor 不调用阻塞式 `wait_threads` 或 task-read 工具来获取常规进度；`waiting_since` 记录等待开始时间，`timeout_at` 默认保持 `null`。只有显式安排 watchdog 时才允许一次有界状态审计；健康时最多再安排一个后续 watchdog，绝不串联阻塞等待。
 
 等待期间不轮询 Worker task、日志、终端或变化中的文件，也不提前运行格式化、lint、typecheck 或 build。常规进度已经在侧栏可见，不需要重复转发。Supervisor 在相关屏障关闭后读取每个参与 Worker 的 scoped diff 和证据，再决定推进、修正或验收。
 
@@ -137,7 +139,7 @@ python3 "${CODEX_HOME:-$HOME/.codex}/skills/.system/skill-installer/scripts/inst
 $luna-supervisor-orchestrator use Luna to implement the requested change.
 ```
 
-完整的 Agent 执行协议位于 [`skills/luna-supervisor-orchestrator/SKILL.md`](skills/luna-supervisor-orchestrator/SKILL.md)。README 解释设计和工作流，`SKILL.md` 是 Codex 实际遵循的权威规则。
+完整的 Agent 执行协议位于 [`skills/luna-supervisor-orchestrator/SKILL.md`](skills/luna-supervisor-orchestrator/SKILL.md)。Skill 内的 README 解释状态机和执行门，`SKILL.md` 是 Codex 实际遵循的权威规则，`scripts/luna-guard.mjs` 提供可执行的 ledger、envelope 和 review 校验。
 
 ## 仓库结构
 
@@ -147,8 +149,11 @@ codex-luna-supervisor/
 ├── README.en.md
 └── skills/luna-supervisor-orchestrator/
     ├── SKILL.md
+    ├── README.md
     ├── agents/openai.yaml
-    └── scripts/luna-fleet.mjs
+    └── scripts/
+        ├── luna-fleet.mjs
+        └── luna-guard.mjs
 ```
 
-`scripts/luna-fleet.mjs` 只供 Codex app 内的 Supervisor 在严格隔离、持久化原始事件或恢复会话时调用，不构成独立的 CLI 产品入口。侧栏可见的 Codex task 始终是默认执行方式。
+`scripts/luna-fleet.mjs` 只供 Codex app 内的 Supervisor 在严格隔离、持久化原始事件或恢复会话时调用，不构成独立的 CLI 产品入口。`scripts/luna-guard.mjs` 用于在状态转换前校验 ledger、事件 envelope 和 review 证据。侧栏可见的 Codex task 始终是默认执行方式。

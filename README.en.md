@@ -25,11 +25,11 @@ The current Codex task always remains the Supervisor. Before dispatch, it builds
 
 The normal execution surfaces are:
 
-| Surface | Purpose | Boundary |
-| --- | --- | --- |
-| Sidebar Luna task | Non-trivial implementation, integration, correction, and review | Each Writer edits only its assigned scope |
-| Native read-only Scout | Bounded source discovery and evidence collection | No writes or recursive delegation; reports only to its parent task |
-| `luna-fleet.mjs` | Used by the in-app Supervisor for strict isolation, persistent raw events, or session resume | Internal fallback only; it is not a standalone CLI entry point |
+| Surface                | Purpose                                                                                      | Boundary                                                           |
+| ---------------------- | -------------------------------------------------------------------------------------------- | ------------------------------------------------------------------ |
+| Sidebar Luna task      | Non-trivial implementation, integration, correction, and review                              | Each Writer edits only its assigned scope                          |
+| Native read-only Scout | Bounded source discovery and evidence collection                                             | No writes or recursive delegation; reports only to its parent task |
+| `luna-fleet.mjs`       | Used by the in-app Supervisor for strict isolation, persistent raw events, or session resume | Internal fallback only; it is not a standalone CLI entry point     |
 
 ## Supervisor Responsibilities
 
@@ -68,12 +68,12 @@ This is a responsibility-based example, not a template that must be filled. Omit
 
 ## Topology And Parallelism
 
-| Topology | Use when | Main constraint |
-| --- | --- | --- |
-| Single writer | One cohesive implementation scope | Record why decomposition would not help |
-| Multi-writer | Multiple responsibilities are independently editable | Scopes do not overlap, or each Writer uses an isolated worktree |
-| Integration Writer | Shared, generated, registry, or cross-cutting files must change | Runs sequentially after implementation and exclusively owns shared files |
-| Reviewer | Risk justifies an independent check | Starts read-only after implementation is idle and integration is complete |
+| Topology           | Use when                                                        | Main constraint                                                           |
+| ------------------ | --------------------------------------------------------------- | ------------------------------------------------------------------------- |
+| Single writer      | One cohesive implementation scope                               | Record why decomposition would not help                                   |
+| Multi-writer       | Multiple responsibilities are independently editable            | Scopes do not overlap, or each Writer uses an isolated worktree           |
+| Integration Writer | Shared, generated, registry, or cross-cutting files must change | Runs sequentially after implementation and exclusively owns shared files  |
+| Reviewer           | Risk justifies an independent check                             | Starts read-only after implementation is idle and integration is complete |
 
 A Runtime/UI dependency on types, events, or snapshots does not automatically require serial work. An interface that can be frozen in advance is a contract dependency. Only inseparable write overlap or a true execution prerequisite requires sequencing.
 
@@ -87,6 +87,8 @@ Workers notify the Supervisor only at bounded checkpoints:
 - `LUNA_BLOCKED`: progress requires a Supervisor decision.
 - `LUNA_DONE`: the Worker completed its current phase.
 - `LUNA_CORRECTION_DONE`: a bounded correction is complete.
+
+Normal waiting is callback-only: Workers wake the Supervisor by reverse-sending the `LUNA_*` events above. The Supervisor does not call blocking `wait_threads` or task-read tools for routine progress; `waiting_since` records when waiting began and `timeout_at` remains `null` by default. Only an explicitly scheduled watchdog may perform one bounded status audit; when progress is healthy, it may schedule at most one later watchdog and never chain blocking waits.
 
 While waiting, the Supervisor does not poll Worker tasks, logs, terminals, or changing files, and does not run formatting, lint, typecheck, or builds early. Routine progress is already visible in the sidebar. After the relevant barrier closes, the Supervisor reads each participating Worker's scoped diff and evidence and then advances, requests correction, or accepts the result.
 
@@ -137,7 +139,7 @@ Invoke it explicitly when a larger task is suitable for delegated Luna implement
 $luna-supervisor-orchestrator use Luna to implement the requested change.
 ```
 
-The complete agent-facing protocol lives in [`skills/luna-supervisor-orchestrator/SKILL.md`](skills/luna-supervisor-orchestrator/SKILL.md). The README explains the design and workflow; `SKILL.md` is the authoritative operating contract that Codex follows.
+The complete agent-facing protocol lives in [`skills/luna-supervisor-orchestrator/SKILL.md`](skills/luna-supervisor-orchestrator/SKILL.md). The Skill README explains the state machine and execution gates; `SKILL.md` is the authoritative operating contract that Codex follows, and `scripts/luna-guard.mjs` provides executable ledger, envelope, and review validation.
 
 ## Repository Layout
 
@@ -147,8 +149,11 @@ codex-luna-supervisor/
 ├── README.en.md
 └── skills/luna-supervisor-orchestrator/
     ├── SKILL.md
+    ├── README.md
     ├── agents/openai.yaml
-    └── scripts/luna-fleet.mjs
+    └── scripts/
+        ├── luna-fleet.mjs
+        └── luna-guard.mjs
 ```
 
-`scripts/luna-fleet.mjs` is only invoked by a Supervisor running inside the Codex app when strict isolation, persistent raw events, or session resume is required. It is not a standalone CLI product surface. Sidebar-visible Codex tasks are always the default execution surface.
+`scripts/luna-fleet.mjs` is only invoked by a Supervisor running inside the Codex app when strict isolation, persistent raw events, or session resume is required. It is not a standalone CLI product surface. `scripts/luna-guard.mjs` validates ledger, event envelope, and review evidence before state transitions. Sidebar-visible Codex tasks are always the default execution surface.

@@ -7,15 +7,6 @@ description: Orchestrate bounded GPT-5.6 Luna work as a Supervisor-owned multi-w
 
 Keep the current Codex task as the sole Supervisor. The Supervisor owns the result, acceptance decision, DAG, worker boundaries, phase barriers, cross-worker communication, verification, and final handoff. Workers provide scoped execution or read-only evidence; they do not redefine the task.
 
-## Check Runtime Capabilities
-
-Before choosing an execution surface, inspect the tools and model combinations actually available in the current Codex environment.
-
-- Sidebar orchestration requires the Codex thread tools for listing projects, creating tasks, setting titles, sending instructions, reading bounded checkpoints, and waiting for events.
-- Never claim that a sidebar Worker was created or notified when the corresponding tool call is unavailable or failed.
-- Require `gpt-5.6-luna` to be available for Worker tasks. If it is unavailable, report the capability blocker instead of silently substituting another model.
-- The CLI fallback requires Node.js and a working `codex` executable. Use it only under the fallback boundary documented below; if neither execution surface is available, stop before dispatch and report the missing capability.
-
 ## Define The Execution Contract
 
 Before launching any worker, write a short execution brief containing:
@@ -55,23 +46,23 @@ Use these states as a low-freedom state machine. A completed dispatch batch is a
 ### PLANNING
 
 - Finish foundational reading, acceptance criteria, frozen contracts, ownership, worker and scout allocation, notification policy, and planned verification before any dispatch.
-- Before launch, complete the impact map and DAG, then record dispatch_batch, expected_events, pending_barrier, and terminal_workers in the Supervisor ledger or task.md. Set waiting_since and timeout_at only immediately after the full dispatch batch or correction batch succeeds.
-- If preparation is incomplete, do not launch. After the complete batch succeeds, set waiting_since and timeout_at, then enter WAITING_FOR_EVENT immediately.
+- Before launch, complete the impact map and DAG, then record dispatch_batch, expected_events, pending_barrier, and terminal_workers in the Supervisor ledger or task.md. Set waiting_since immediately after the full dispatch batch or correction batch succeeds; leave timeout_at null unless an optional watchdog is explicitly scheduled.
+- If preparation is incomplete, do not launch. After the complete batch succeeds, set waiting_since and enter callback-only WAITING_FOR_EVENT immediately.
 
 ### WAITING_FOR_EVENT
 
-- Wait for only LUNA_PLAN when approval is required, LUNA_BLOCKED, a LUNA_DONE envelope, LUNA_CORRECTION_DONE, a new user instruction, or a 10-minute no-checkpoint timeout.
+- Use callback-only waiting: Worker reverse-send delivery of LUNA_PLAN, LUNA_BLOCKED, LUNA_DONE, or LUNA_CORRECTION_DONE is the normal wake. A new user instruction or an explicitly scheduled watchdog may also wake the Supervisor.
 - Do not call codex_app\_\_read_thread, list_threads, status, log, terminal, or equivalent Worker-task polling tools for polling.
 - Do not read Worker-owned changing files, scoped diffs, reports, terminals, raw events, or status output except under the narrow decision and timeout-audit exceptions below.
 - Do not rerun decomposition, reopen frozen decisions, reread foundational docs, speculate about Worker progress, or relay routine progress.
 - Do not run formatting, lint, typecheck, build, validation, or forward tests early. Do not launch overlapping workers or subagents or send status requests merely to remain active.
 - Sidebar routine progress is user-observable; it does not need Supervisor relays.
 
-For LUNA_PLAN when approval is required, or LUNA_BLOCKED when a decision needs full evidence, authorize exactly one bounded read of only the notifying Worker task for that applicable checkpoint. Do not read other Worker tasks. After a successful approval or resolution instruction, set waiting_since=now and timeout_at=now+10m immediately before returning to WAITING_FOR_EVENT; never reset before a required send succeeds.
+For LUNA_PLAN when approval is required, or LUNA_BLOCKED when a decision needs full evidence, authorize exactly one bounded read of only the notifying Worker task for that applicable checkpoint. Do not read other Worker tasks. A reverse-send failure permits that bounded read only after a user instruction or watchdog wake. After a successful approval or resolution instruction, set waiting_since=now and leave timeout_at null unless scheduling one optional watchdog; never reset before a required send succeeds.
 
-On a LUNA_DONE envelope, inspect only its envelope and update barrier state and terminal_workers. If required nodes are not terminal, after that update succeeds set waiting_since=now and timeout_at=now+10m immediately before returning to WAITING_FOR_EVENT without reading that Worker task. Read each participating Worker task only after the barrier closes.
+On a LUNA_DONE envelope, inspect only its envelope and update barrier state and terminal_workers. If required nodes are not terminal, after that update succeeds set waiting_since=now and return to callback-only WAITING_FOR_EVENT without reading that Worker task. Read each participating Worker task only after the barrier closes.
 
-At a 10-minute no-checkpoint timeout, permit exactly one bounded status/task anomaly audit. Do not audit more than once per 10-minute window; otherwise the polling prohibition remains absolute. If the Worker is active with recent progress and no blocker, set timeout_at=now+10m and return to WAITING_FOR_EVENT. If stalled, failed, or missing, intervene using only the audit evidence.
+At an explicitly scheduled watchdog wake, permit exactly one bounded status/task anomaly audit. If the Worker is active with recent progress and no blocker, schedule at most one later watchdog by setting timeout_at after waiting_since and return to callback-only WAITING_FOR_EVENT. If stalled, failed, or missing, intervene using only the audit evidence. Never chain blocking waits.
 
 A closed barrier or LUNA_CORRECTION_DONE transitions to REVIEWING_BARRIER or ACCEPTING and never resets a waiting deadline. A new user instruction returns to PLANNING without resetting a worker wait. Routine sidebar progress, speculation, file reads, status requests, and polling never count as checkpoints and never reset the window.
 
@@ -90,6 +81,44 @@ Formulate only the bounded correction, affected paths, contract decision, and re
 ### ACCEPTING
 
 Run only the planned verification after the final barrier, inspect the final scoped evidence, and make the acceptance decision. Do not start new worker work from this state.
+
+## Run The Executable Gates
+
+Use the dependency-free guard before each matching state-machine action. Keep exactly one JSON object between `<!-- luna-guard:start -->` and `<!-- luna-guard:end -->` in the Supervisor task ledger. The ledger schema uses `schema_version: 1`, the five states above, unique node/event arrays, and state-specific evidence. Active `PLANNING`, `CORRECTING`, `WAITING_FOR_EVENT`, and `REVIEWING_BARRIER` ledgers must not have vacuous active batches; `ACCEPTING` remains free of unrelated batch requirements.
+
+### DISPATCH_GATE
+
+Before initial or correction dispatch, run:
+
+```bash
+node ~/.codex/skills/luna-supervisor-orchestrator/scripts/luna-guard.mjs ledger <task.md>
+```
+
+In `PLANNING` and `CORRECTING`, `ready_nodes`, `dispatch_batch`, and `expected_events` must be non-empty, `ready_nodes` and `dispatch_batch` must be equal sets, and `waiting_since`/`timeout_at` must be null. If present, `launch_results` must be `{}` before sending. Record the complete batch before launching or sending it. Launch or instruct every node in that batch successfully before entering the wait state.
+
+### WAIT_GATE
+
+After the complete dispatch or correction send succeeds, update the ledger to `WAITING_FOR_EVENT` and run the same `ledger` command. `dispatch_batch` and `expected_events` must be non-empty. `launch_results` keys must equal `dispatch_batch` exactly, with every value exactly `"launched"` or `"instructed"`; `waiting_since` must be non-null, while `timeout_at` may be null for callback-only waiting and, when present, must be after `waiting_since` using valid ISO timestamps. Do not call a blocking wait or task-read tool for normal waiting; Worker reverse-send delivery is the sole normal wake. An explicitly scheduled watchdog may wake one bounded audit, after which either intervene or schedule one later watchdog.
+
+### EVENT_GATE
+
+Before recording a checkpoint or changing barrier state, validate the exact envelope:
+
+```bash
+node ~/.codex/skills/luna-supervisor-orchestrator/scripts/luna-guard.mjs envelope '<json>' --source-thread-id <source-thread-id>
+```
+
+The command accepts only `LUNA_PLAN`, `LUNA_BLOCKED`, `LUNA_DONE`, and `LUNA_CORRECTION_DONE`, with exact keys and counted unique changed paths. An invalid envelope is a non-event and cannot close a barrier. Allow one envelope-only resend from the same Worker; do not relaunch, re-dispatch, or read changing Worker evidence for that recovery.
+
+### REVIEW_GATE
+
+Before reviewer dispatch, record `review_target_barrier_id`, `barrier_closed_at`, `scope_revision`, and `review_changed_paths={count,paths}` in the current Supervisor ledger. Before accepting review evidence, require current reviewer metadata and run:
+
+```bash
+node ~/.codex/skills/luna-supervisor-orchestrator/scripts/luna-guard.mjs review '<json>' --ledger <task.md>
+```
+
+The review command requires the authoritative ledger fields and compares submitted target/current barriers, closure timestamp, scope revisions, and changed paths against that ledger. The review object must identify a real reviewer UUID, use valid closure/start timestamps with `review_started_at` strictly after `barrier_closed_at`, and report counted unique changed paths. A standalone `review '<json>'` is invalid. If freshness fails, refresh the current ledger metadata and reviewer evidence; do not accept or patch stale review output.
 
 ## Separate Roles
 
