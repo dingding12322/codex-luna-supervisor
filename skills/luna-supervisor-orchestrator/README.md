@@ -84,13 +84,16 @@ Run the dependency-free guard from any checkout:
 
 ```bash
 node ~/.codex/skills/luna-supervisor-orchestrator/scripts/luna-guard.mjs ledger <task.md>
-node ~/.codex/skills/luna-supervisor-orchestrator/scripts/luna-guard.mjs envelope '<json>' --source-thread-id <source-thread-id>
+node ~/.codex/skills/luna-supervisor-orchestrator/scripts/luna-guard.mjs envelope '<json>' --supervisor-thread-id <supervisor-thread-id>
+node ~/.codex/skills/luna-supervisor-orchestrator/scripts/luna-guard.mjs read-gate '<json>' --ledger <task.md> --supervisor-thread-id <supervisor-thread-id>
 node ~/.codex/skills/luna-supervisor-orchestrator/scripts/luna-guard.mjs review '<json>' --ledger <task.md>
 ```
 
 The ledger command reads exactly one marker block. `PLANNING` and `CORRECTING` require non-empty `ready_nodes`, `dispatch_batch`, and `expected_events`, equal unique `ready_nodes`/`dispatch_batch` sets, null wait timestamps, and empty pre-send `launch_results` when that field is present. `WAITING_FOR_EVENT` requires non-empty `dispatch_batch`/`expected_events`, exact launch-result keys matching `dispatch_batch`, and values exactly `"launched"` or `"instructed"`, plus non-null ISO `waiting_since`; `timeout_at` may be null for callback-only waiting and, when present, must be later. `REVIEWING_BARRIER` requires non-empty `dispatch_batch`/`expected_events`, `barrier_closed_at`, and terminal coverage; `ACCEPTING` keeps the common ledger checks without requiring unrelated fields.
 
-The envelope command rejects unknown or missing keys, placeholder Worker IDs, source/Worker ID equality, invalid event decisions, and changed-path count mismatches. An invalid envelope is a non-event and never closes a barrier. Allow one envelope-only resend from the same Worker after correcting the payload; do not relaunch or re-dispatch for that recovery.
+The envelope command requires the Supervisor notification-target UUID, rejects unknown or missing keys, placeholder Worker IDs, Supervisor/Worker ID equality, inconsistent decision and contract-change fields, and changed-path count mismatches. `--source-thread-id` remains a compatibility alias, but new commands use the semantic `--supervisor-thread-id` name. An invalid envelope is a non-event and never closes a barrier. Allow one envelope-only resend from the same Worker using the Guard's repair guidance; do not relaunch or re-dispatch for that recovery.
+
+The read-gate command checks the accepted envelope against the authoritative ledger. Run it against the matching `WAITING_FOR_EVENT` ledger before entering `LUNA_PLAN`/`LUNA_BLOCKED` decision handling; it permits a completion read only after the matching barrier closes in `REVIEWING_BARRIER`. Event validation by itself does not authorize a task read.
 
 Before reviewer dispatch, record `review_target_barrier_id`, `barrier_closed_at`, `scope_revision`, and `review_changed_paths={count,paths}` in the current Supervisor ledger. The review command requires `--ledger <task.md>` and compares the submitted target/current barrier, closure timestamp, scope revisions, and changed paths exactly against those authoritative fields. A standalone review command fails with usage guidance. It also requires a current reviewer UUID, valid timestamps, and `review_started_at` strictly after `barrier_closed_at`; a reviewer from an earlier barrier or earlier user turn cannot satisfy the current review phase. If freshness fails, refresh the ledger metadata and reviewer evidence rather than accepting stale output.
 
@@ -141,7 +144,7 @@ Each scout has a stable name, a non-overlapping read scope, explicit questions a
 
 | Surface                                        | Owner                      | May write                                               | May communicate                     |
 | ---------------------------------------------- | -------------------------- | ------------------------------------------------------- | ----------------------------------- |
-| Result, DAG, barriers, task.md, final decision | Supervisor                 | Coordination files and authorized integration decisions | All workers, at bounded checkpoints |
+| Result, DAG, barriers, task.md, final decision | Supervisor                 | Coordination files and ledger metadata only after dispatch | All workers, at bounded checkpoints |
 | Runtime/UI implementation                      | Assigned writer            | Its own non-overlapping scope                           | Supervisor only                     |
 | Shared/cross-cutting files                     | Integration Writer         | Shared scope, sequentially                              | Supervisor only                     |
 | Runtime/UI review                              | Supervisor-owned reviewer  | Nothing                                                 | Supervisor only                     |
@@ -175,7 +178,7 @@ When the Worker UUID is unknown, use `null`; the Supervisor resolves sender iden
 
 ## Correction And 429 Flow
 
-Send corrections to the same worker thread and keep its original scope and session lineage. State only the blocking finding, affected paths, contract decision, and required checks. Review the result at the correction barrier.
+Send corrections to the same worker thread and keep its original scope and session lineage. State only the blocking finding, affected paths, contract decision, and required checks. The Supervisor never edits Worker-owned product source or documentation after dispatch, including trivial or one-line fixes. If the original lineage cannot continue after its defined recovery path, return to PLANNING and explicitly reassign ownership before replacement edits. Review the result at the correction barrier.
 
 For a visible or reported 429 Too Many Requests, resume the original same-thread/same-session worker immediately with the exact message 继续. Do not poll status or logs, create a replacement, resend the full assignment, or switch to another surface. The CLI equivalent is luna-fleet.mjs resume against the original run and worker with the original effort.
 
@@ -205,6 +208,7 @@ Keep ~/.codex/luna-fleet-runs/ and the script filename unchanged. CLI workers st
 - [ ] Launch sidebar workers with explicit scopes, effort, phase, barrier, and contract.
 - [ ] While waiting, consume Worker reverse-send notifications only; a scheduled watchdog permits one bounded audit and at most one later watchdog timestamp.
 - [ ] Allow only the notifying-task read for a required PLAN/BLOCKED decision after a user instruction or watchdog wake; a scheduled watchdog permits one bounded audit, then either intervene or schedule one later watchdog.
+- [ ] Run `read-gate` before every permitted Worker-task read; event validation alone is not read authorization.
 - [ ] Read worker tasks at most once per applicable checkpoint/barrier: after closure except for the narrow decision exception.
 - [ ] Integrate shared files sequentially when applicable, then start read-only reviewers only when risk justifies them.
 - [ ] Before reviewer dispatch, record authoritative review barrier, closure timestamp, scope revision, and changed paths in the Supervisor ledger; run `review '<json>' --ledger <task.md>` for acceptance.

@@ -105,10 +105,20 @@ After the complete dispatch or correction send succeeds, update the ledger to `W
 Before recording a checkpoint or changing barrier state, validate the exact envelope:
 
 ```bash
-node ~/.codex/skills/luna-supervisor-orchestrator/scripts/luna-guard.mjs envelope '<json>' --source-thread-id <source-thread-id>
+node ~/.codex/skills/luna-supervisor-orchestrator/scripts/luna-guard.mjs envelope '<json>' --supervisor-thread-id <supervisor-thread-id>
 ```
 
-The command accepts only `LUNA_PLAN`, `LUNA_BLOCKED`, `LUNA_DONE`, and `LUNA_CORRECTION_DONE`, with exact keys and counted unique changed paths. An invalid envelope is a non-event and cannot close a barrier. Allow one envelope-only resend from the same Worker; do not relaunch, re-dispatch, or read changing Worker evidence for that recovery.
+The `--supervisor-thread-id` value is the Supervisor task UUID that receives reverse notifications, not the Worker UUID. The legacy `--source-thread-id` spelling remains accepted for compatibility, but do not use it in new commands. The command accepts only `LUNA_PLAN`, `LUNA_BLOCKED`, `LUNA_DONE`, and `LUNA_CORRECTION_DONE`, with exact keys, counted unique changed paths, and consistent `decision_required`/`contract_changes` values. An invalid envelope is a non-event and cannot close a barrier. Use the Guard's repair message to request one envelope-only resend from the same Worker; do not relaunch, re-dispatch, or read changing Worker evidence for that recovery.
+
+### READ_GATE
+
+Before every Worker-task read, validate the accepted envelope against the current ledger:
+
+```bash
+node ~/.codex/skills/luna-supervisor-orchestrator/scripts/luna-guard.mjs read-gate '<json>' --ledger <task.md> --supervisor-thread-id <supervisor-thread-id>
+```
+
+The gate authorizes a decision-required `LUNA_PLAN` or `LUNA_BLOCKED` read only against the matching `WAITING_FOR_EVENT` ledger; run it before transitioning into decision handling. It authorizes `LUNA_DONE` or `LUNA_CORRECTION_DONE` reads only after the matching barrier is closed and the ledger is in `REVIEWING_BARRIER`. A successful event validation alone is never read authorization.
 
 ### REVIEW_GATE
 
@@ -122,7 +132,7 @@ The review command requires the authoritative ledger fields and compares submitt
 
 ## Separate Roles
 
-- Supervisor: define the contract, create the DAG, launch workers, approve plans, freeze interfaces, resolve blockers, close barriers, inspect diffs and evidence, request corrections, and accept or reject the result.
+- Supervisor: define the contract, create the DAG, launch workers, approve plans, freeze interfaces, resolve blockers, close barriers, inspect diffs and evidence, request corrections, and accept or reject the result. After dispatch, write only Supervisor-owned coordination files and ledger metadata; never edit Worker-owned product source or documentation.
 - Implementation writer: edit only its assigned write scope and return evidence. It owns no shared file unless explicitly assigned.
 - Integration Writer: when applicable, run sequentially after implementation writers and own all shared or cross-cutting files. Resolve interface wiring here.
 - Reviewer: a Supervisor-owned read-only worker. When used, start runtime and UI reviewers after any applicable integration phase and after implementation workers are idle. Reviewers are never nested inside implementation workers.
@@ -138,6 +148,8 @@ Use the topology with the shortest justified serial critical path. Do not collap
 ### Single writer
 
 Use one sidebar-visible implementation worker for a cohesive change only after the Supervisor records `single_writer_reason`. Approve zero, one, or two non-overlapping read-only scouts inside that worker when broad discovery warrants it. The worker remains the only source writer until the Supervisor reviews the result.
+
+Once a Writer is dispatched, keep every correction to its owned source or documentation on that original Worker lineage, including trivial or one-line fixes. Do not let the Supervisor patch the result to accelerate acceptance. If the original Worker cannot continue after the defined same-lineage recovery path, return to PLANNING and explicitly reassign ownership before any replacement edits.
 
 ### Multi-writer
 
@@ -175,33 +187,22 @@ Use native V2 spawn_agent only for approved read-only exploration or independent
 
 ## Launch Sidebar Workers
 
-Use sidebar-visible Codex tasks by default for non-trivial writes and reviews. For project-scoped work, call codex_app\_\_list_projects first, then create one task per cohesive writer with the local project target:
+Use sidebar-visible Codex tasks by default for non-trivial writes and reviews. For project-scoped work, call codex_app\_\_list_projects first, then call codex_app\_\_create_thread directly with structured arguments for one cohesive writer:
 
-```ts
-const worker = await codex_app__create_thread({
-  model: "gpt-5.6-luna",
-  thinking: "max",
-  prompt:
-    "[Luna] <assignment>. Edit only <scope>. Contract: <frozen interfaces>. " +
-    "Phase: <phase>; barrier: <barrier>. Internal scouts: <approved names or none>. " +
-    "Before your final response, actually call codex_app__send_message_to_thread " +
-    "with the delegation source_thread_id and the required checkpoint payload; " +
-    "printing the payload in final does not count as delivery. " +
-    "Return changed paths, verification evidence, and notification_delivery status.",
-  target: {
-    type: "project",
-    projectId,
-    environment: { type: "local" },
-  },
-});
-
-await codex_app__set_thread_title({
-  threadId: worker.threadId,
-  title: "[Luna] <assignment>",
-});
+```json
+{
+  "model": "gpt-5.6-luna",
+  "thinking": "max",
+  "prompt": "[Luna] <assignment>. Edit only <scope>. Contract: <frozen interfaces>. Phase: <phase>; barrier: <barrier>. Internal scouts: <approved names or none>. Before your final response, actually call codex_app__send_message_to_thread with the delegation source_thread_id and the required checkpoint payload; printing the payload in final does not count as delivery. Return changed paths, verification evidence, and notification_delivery status.",
+  "target": {
+    "type": "project",
+    "projectId": "<project-id>",
+    "environment": { "type": "local" }
+  }
+}
 ```
 
-State each worker's assignment, write scope, mode, reasoning effort, phase, barrier, exclusions, frozen contract, verification, internal scouts, and the mandatory reverse-send action in the launch prompt. Say internal scouts: none when none are approved. Never weaken the callback to "if supported"; unavailable or failed delivery must use the explicit failure report and bounded Supervisor fallback.
+Pass task text only as the tool's structured `prompt` value. Never interpolate Worker prompts into shell commands, JavaScript source, command substitution, or executable strings. After creation, set the title with a separate codex_app\_\_set_thread_title call. State each worker's assignment, write scope, mode, reasoning effort, phase, barrier, exclusions, frozen contract, verification, internal scouts, and the mandatory reverse-send action in the launch prompt. Say internal scouts: none when none are approved. Never weaken the callback to "if supported"; unavailable or failed delivery must use the explicit failure report and bounded Supervisor fallback.
 
 For complex or high-risk work, launch plan-only. Require the plan to list files, interfaces, dependencies, risks, and checks, then stop before editing. Read and approve it explicitly with codex_app\_\_send_message_to_thread; a plan is not approval.
 
@@ -216,6 +217,8 @@ Give each phase a stable ID and each barrier a stable barrier_id. Track worker s
 - Routine progress, reasoning, logs, command output, and minute-by-minute status are never notifications.
 
 After a relevant barrier closes, read each participating worker task at most once for that applicable checkpoint or barrier, inspect its scoped diff and evidence, and decide whether to advance, integrate, review, or correct. A required PLAN or BLOCKED decision may use only the single notifying-task read permitted above before closure. If review finds a blocking issue, send the correction to the same worker thread and keep the same assignment lineage.
+
+Run `read-gate` before each permitted Worker-task read. Do not treat successful `envelope` validation as permission to read.
 
 ## Use Bounded Notifications
 
@@ -278,6 +281,8 @@ node ~/.codex/skills/luna-supervisor-orchestrator/scripts/luna-fleet.mjs resume 
 ```
 
 Use the same thread or CLI session for corrections. Send only the bounded issue, affected paths, contract decision, and required checks. Process the result at the correction barrier, then rerun only checks affected by the correction.
+
+Never apply a Worker-owned source or documentation correction in the Supervisor task, regardless of size. Keep it on the original Writer lineage unless PLANNING explicitly reassigns ownership after the original lineage becomes unavailable.
 
 ## Verify And Accept
 

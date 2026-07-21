@@ -55,6 +55,14 @@ const LEDGER_ARRAY_KEYS = [
   "terminal_workers",
 ];
 const SUCCESSFUL_LAUNCH_RESULTS = new Set(["launched", "instructed"]);
+const SUPERVISOR_THREAD_ID_FLAGS = new Set([
+  "--supervisor-thread-id",
+  "--source-thread-id",
+]);
+const ENVELOPE_USAGE =
+  "envelope <json> --supervisor-thread-id <supervisor-thread-id>";
+const READ_GATE_USAGE =
+  "read-gate <json> --ledger <task.md> --supervisor-thread-id <supervisor-thread-id>";
 const PLACEHOLDER_VALUES = new Set([
   "actual-uuid",
   "current-worker",
@@ -416,7 +424,7 @@ function assertLedger(ledger) {
   }
 }
 
-function assertEnvelope(envelope, sourceThreadId) {
+function assertEnvelope(envelope, supervisorThreadId) {
   requireRecord(envelope, "envelope JSON");
   requireKeys(envelope, ENVELOPE_KEYS, "envelope");
   requireString(envelope.event, "envelope.event");
@@ -426,14 +434,14 @@ function assertEnvelope(envelope, sourceThreadId) {
   if (envelope.worker_thread_id !== null) {
     requireUuid(envelope.worker_thread_id, "envelope.worker_thread_id");
   }
-  if (sourceThreadId !== undefined) {
-    requireUuid(sourceThreadId, "--source-thread-id");
-    if (
-      envelope.worker_thread_id !== null &&
-      envelope.worker_thread_id.toLowerCase() === sourceThreadId.toLowerCase()
-    ) {
-      fail("envelope.worker_thread_id must not equal --source-thread-id");
-    }
+  requireUuid(supervisorThreadId, "--supervisor-thread-id");
+  if (
+    envelope.worker_thread_id !== null &&
+    envelope.worker_thread_id.toLowerCase() === supervisorThreadId.toLowerCase()
+  ) {
+    fail(
+      "envelope.worker_thread_id must not equal the Supervisor notification target; pass the Supervisor task UUID to --supervisor-thread-id",
+    );
   }
   requireString(envelope.assignment_or_status, "envelope.assignment_or_status");
   requireString(envelope.phase, "envelope.phase");
@@ -443,6 +451,15 @@ function assertEnvelope(envelope, sourceThreadId) {
   requireChangedPaths(envelope.changed_paths, "envelope.changed_paths");
   requireString(envelope.validation_summary, "envelope.validation_summary");
   requireString(envelope.request, "envelope.request");
+
+  if (
+    envelope.contract_changes.length > 0 &&
+    !envelope.decision_required
+  ) {
+    fail(
+      'contract_changes is non-empty; resend the same envelope with "decision_required": true',
+    );
+  }
 
   if (envelope.event === "LUNA_PLAN") {
     if (!envelope.decision_required) {
@@ -458,10 +475,35 @@ function assertEnvelope(envelope, sourceThreadId) {
   if (
     (envelope.event === "LUNA_DONE" ||
       envelope.event === "LUNA_CORRECTION_DONE") &&
-    envelope.decision_required !== envelope.contract_changes.length > 0
+    envelope.contract_changes.length === 0 &&
+    envelope.decision_required
   ) {
     fail(
-      `${envelope.event} requires decision_required=false unless contract_changes is non-empty`,
+      `${envelope.event} has no contract_changes; resend the same envelope with "decision_required": false`,
+    );
+  }
+}
+
+function assertReadGate(envelope, ledger) {
+  if (envelope.barrier_id !== ledger.pending_barrier) {
+    fail("envelope.barrier_id must equal ledger.pending_barrier before reading");
+  }
+  if (!ledger.expected_events.includes(envelope.event)) {
+    fail("envelope.event must be listed in ledger.expected_events before reading");
+  }
+
+  if (envelope.event === "LUNA_PLAN" || envelope.event === "LUNA_BLOCKED") {
+    if (ledger.state !== "WAITING_FOR_EVENT") {
+      fail(
+        `${envelope.event} task reads require ledger.state=WAITING_FOR_EVENT`,
+      );
+    }
+    return;
+  }
+
+  if (ledger.state !== "REVIEWING_BARRIER") {
+    fail(
+      `${envelope.event} task reads require a closed barrier and ledger.state=REVIEWING_BARRIER`,
     );
   }
 }
@@ -613,18 +655,31 @@ function parseJsonArgument(raw, label) {
 }
 
 function parseEnvelopeArguments(args) {
-  if (args.length < 1 || args.length > 3) {
-    fail("usage: envelope <json> [--source-thread-id <id>]");
+  if (
+    args.length !== 3 ||
+    !SUPERVISOR_THREAD_ID_FLAGS.has(args[1])
+  ) {
+    fail(`usage: ${ENVELOPE_USAGE}`);
   }
-  const rawJson = args[0];
-  let sourceThreadId;
-  if (args.length === 2 || args.length === 3) {
-    if (args.length !== 3 || args[1] !== "--source-thread-id") {
-      fail("usage: envelope <json> [--source-thread-id <id>]");
-    }
-    sourceThreadId = args[2];
+  return {
+    envelope: parseJsonArgument(args[0], "envelope"),
+    supervisorThreadId: args[2],
+  };
+}
+
+function parseReadGateArguments(args) {
+  if (
+    args.length !== 5 ||
+    args[1] !== "--ledger" ||
+    !SUPERVISOR_THREAD_ID_FLAGS.has(args[3])
+  ) {
+    fail(`usage: ${READ_GATE_USAGE}`);
   }
-  return { envelope: parseJsonArgument(rawJson, "envelope"), sourceThreadId };
+  return {
+    envelope: parseJsonArgument(args[0], "envelope"),
+    ledgerPath: args[2],
+    supervisorThreadId: args[4],
+  };
 }
 
 function run(command, args) {
@@ -636,9 +691,17 @@ function run(command, args) {
     return "ledger: valid";
   }
   if (command === "envelope") {
-    const { envelope, sourceThreadId } = parseEnvelopeArguments(args);
-    assertEnvelope(envelope, sourceThreadId);
+    const { envelope, supervisorThreadId } = parseEnvelopeArguments(args);
+    assertEnvelope(envelope, supervisorThreadId);
     return "envelope: valid";
+  }
+  if (command === "read-gate") {
+    const { envelope, ledgerPath, supervisorThreadId } =
+      parseReadGateArguments(args);
+    assertEnvelope(envelope, supervisorThreadId);
+    const ledger = readLedger(ledgerPath);
+    assertReadGate(envelope, ledger);
+    return "read-gate: authorized";
   }
   if (command === "review") {
     if (args.length !== 3 || args[1] !== "--ledger") {
@@ -650,7 +713,7 @@ function run(command, args) {
     return "review: valid";
   }
   fail(
-    "usage: luna-guard.mjs ledger <task.md> | envelope <json> [--source-thread-id <id>] | review <json> --ledger <task.md>",
+    `usage: luna-guard.mjs ledger <task.md> | ${ENVELOPE_USAGE} | ${READ_GATE_USAGE} | review <json> --ledger <task.md>`,
   );
 }
 
